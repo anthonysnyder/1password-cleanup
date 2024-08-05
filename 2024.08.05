@@ -1,0 +1,130 @@
+#!/bin/bash
+
+################################################################################
+# Delete Inactive Suspended Members Script                                     #
+################################################################################
+#                                                                              #
+# This script deletes inactive suspended members from 1Password based on       #
+# configurable criteria. It performs the following tasks:                      #
+#                                                                              #
+# 1. Checks for an active 1Password session or prompts the user to sign in.    #
+# 2. Fetches a list of suspended members from 1Password.                       #
+# 3. Filters suspended members who haven't authenticated in the last N days,   #
+#    where N is configurable at the top of this script.                        #
+# 4. Excludes members listed in the inclusion list from deletion.              #
+# 5. Confirms deletion with the user and proceeds upon confirmation.           #
+# 6. Deletes the eligible suspended members from 1Password.                    #
+#                                                                              #
+# Configuration:                                                               #
+# - Adjust the 'inactivity_days' variable to set the inactivity threshold.     #
+# - Populate the 'inclusion_list' array with email addresses to exclude from   #
+#   deletion.                                                                  #
+#                                                                              #
+# Requirements:                                                                #
+# - 1Password CLI ('op') installed and configured.                             #
+# - 'jq' command-line JSON processor installed.                                #
+#                                                                              #
+# Usage:                                                                       #
+# ./1password_cleanup.sh                                              #
+#                                                                              #
+################################################################################
+
+
+# Configuration variables
+inactivity_days=365  # Default inactivity threshold in days
+inclusion_list=("user1@example.com" "user2@example.com")  # List of users to exclude from deletion
+
+# Function to check if there is an active 1Password session
+check_op_session() {
+    op account get 1>/dev/null 2>/dev/null
+    if [ $? -ne 0 ]; then
+        echo "No active 1Password session found. Please sign into 1Password."
+        signin_output=$(op signin --raw 2>&1)
+        if [ $? -ne 0 ]; then
+            echo "1Password sign-in failed: $signin_output"
+            exit 1
+        fi
+    else
+        echo "Active 1Password session found."
+    fi
+}
+
+# Function to fetch suspended members
+fetch_suspended_members() {
+    echo "Fetching users and filtering for suspended members..."
+    suspended_members=$(op user list --format=json | jq -r '.[] | select(.state == "SUSPENDED") | .id')
+    if [ -z "$suspended_members" ]; then
+        echo "No suspended members found."
+        exit 0
+    fi
+    echo "Suspended members fetched: $(echo "$suspended_members" | wc -l)"
+}
+
+# Function to filter suspended members who haven't authenticated in the last N days
+filter_inactive_suspended_members() {
+    date_inactivity_days_ago=$(date -v-${inactivity_days}d +%Y-%m-%d)
+    echo "Date $inactivity_days days ago: $date_inactivity_days_ago"
+
+    echo "Filtering suspended members who have not authenticated in the last $inactivity_days days..."
+    users_to_delete=()
+    for member_id in $suspended_members; do
+        user_details=$(op user get $member_id --format=json)
+        last_auth_at=$(echo "$user_details" | jq -r '.last_auth_at')
+        
+        if [[ "$last_auth_at" < "$date_inactivity_days_ago" ]]; then
+            email=$(echo "$user_details" | jq -r '.email')
+            # Check if the user is not in the inclusion list
+            if ! [[ " ${inclusion_list[@]} " =~ " ${email} " ]]; then
+                users_to_delete+=("$member_id|$email")
+            fi
+        fi
+    done
+
+    if [ ${#users_to_delete[@]} -eq 0 ]; then
+        echo "No eligible suspended members found for deletion."
+        exit 0
+    fi
+
+    echo "Eligible suspended members to be deleted: ${#users_to_delete[@]}"
+}
+
+# Function to confirm deletion
+confirm_deletion() {
+    echo "The following suspended members have been inactive for more than $inactivity_days days and will be deleted:"
+    for user in "${users_to_delete[@]}"; do
+        IFS='|' read -r user_id email <<< "$user"
+        echo "User ID: $user_id, Email: $email"
+    done
+
+    echo "Total number of users to be deleted: ${#users_to_delete[@]}"
+
+    read -p "Are you sure you want to delete these members? (y/n) " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        echo "Operation cancelled."
+        exit 1
+    fi
+}
+
+# Function to delete suspended members
+delete_suspended_members() {
+    echo "Deleting suspended members..."
+    for user in "${users_to_delete[@]}"; do
+        IFS='|' read -r member_id email <<< "$user"
+        echo "Deleting member with UUID: $member_id"
+        op user delete $member_id
+        if [ $? -eq 0 ]; then
+            echo "Successfully deleted member with UUID: $member_id"
+        else
+            echo "Failed to delete member with UUID: $member_id"
+        fi
+    done
+    echo "Completed deletion of suspended members."
+}
+
+# Main script execution
+check_op_session
+fetch_suspended_members
+filter_inactive_suspended_members
+confirm_deletion
+delete_suspended_members
